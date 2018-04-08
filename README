@@ -1,0 +1,27 @@
+Huge Pages:
+
+Huge pages allow for mapping of contiguous pages in kernel.
+To see how to enable it on debian, see https://wiki.debian.org/Hugepages#pages-size
+
+Following are the steps I took for allocating 2 chunks, each of 1 GB on my system:
+
+1) Run command 'grep pdpe1gb /proc/cpuinfo | uniq'
+If this command output is not empty, the x86 system supports 1GB hugepages.
+
+2) Edit /etc/default/grub to add "hugepagesz=1GB hugepages=2 default_hugepagesz=1GB"
+as boot params.
+This allows kernel to reserve the memory during system boot.
+
+3) Run command 'update-grub2'
+This updates grub so that kernel get the new boot commands.
+
+4) Reboot system
+
+5) Run 'cat /proc/meminfo | grep "Hugepagesize:"'
+The output should be 1048576 kB. This means now the default Hugepage is set to 1GB
+
+6) Run 'cat /proc/meminfo | grep "HugePages_Free:"'
+The output should be 2. This shows 2 chunks of 2 GB has been reserved.
+
+7) Now your application can mmap() using MAP_HUGETLB. 1GB chunks will be used 
+as it is set as the default huge page size.
