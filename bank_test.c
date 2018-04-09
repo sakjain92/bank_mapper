@@ -16,62 +16,71 @@
 #include <stdbool.h>
 #include <sys/ioctl.h>
 
-#define DEBUG
-#ifdef DEBUG
-#define dprintf(...)    printf(__VA_ARGS__)
+#define DEBUG                           1
+#if (DEBUG == 1)
+#define dprintf(...)                    printf(__VA_ARGS__)
 #else
 #define dprintf(...)
 #endif
 
-#define PAGE_SHIFT  12
-#define PAGE_SIZE   (1 << PAGE_SHIFT)
-#define PAGE_MASK   (PAGE_SIZE - 1)
+#define eprint(...)	                    fprintf(stderr, "ERROR:" __VA_ARGS__)
 
+#define PAGE_SHIFT                      12
+#define PAGE_SIZE                       (1 << PAGE_SHIFT)
+#define PAGE_MASK                       (PAGE_SIZE - 1)
+
+// Enable at most one of these option
+// Priority order is: Kernel Allocator module > Huge Page > Simple Iterative mmap()
 // Are we using kernel allocator module to allocate contiguous memory?
-#define KERNEL_ALLOCATOR_MODULE 1
+#define KERNEL_ALLOCATOR_MODULE         0
 #define KERNEL_ALLOCATOR_MODULE_FILE    "/dev/kam"
+#define KERNEL_HUGEPAGE_ENABLED         1
+#define KERNEL_HUGEPAGE_SIZE            (1024 * 1024 * 1024)    // 1 GB
 
-#define MEM_SIZE                (1 << 14)
+#define MEM_SIZE                        (1 << 21)
 
 // Using mmap(), we might/might not get contigous pages. We need to try multiple
 // times.
 // Using kernel module, if we can get, we wll get all contiguous on first attempt
 #if (KERNEL_ALLOCATOR_MODULE == 1)
-#define NUM_CONTIGOUS_PAGES     (MEM_SIZE / PAGE_SIZE)
-#define MAX_MMAP_ITR            1
-#else
-#define NUM_CONTIGOUS_PAGES     5
-#define MAX_MMAP_ITR            10
+#define NUM_CONTIGOUS_PAGES             (MEM_SIZE / PAGE_SIZE)
+#define MAX_MMAP_ITR                    1
+#elif (KERNEL_HUGEPAGE_ENABLED == 1)
+#define NUM_CONTIGOUS_PAGES             (MEM_SIZE > KERNEL_HUGEPAGE_SIZE ?      \
+                                        (KERNEL_HUGEPAGE_SIZE / PAGE_SIZE) :    \
+                                        (MEM_SIZE / PAGE_SIZE))
+#define MAX_MMAP_ITR                    1
 #endif
 
-#define MAX_INNER_LOOP  10
-#define MAX_OUTER_LOOP  100000
+#define MAX_INNER_LOOP                  10
+#define MAX_OUTER_LOOP                  100000
 
 // Threshold for timing
-#define THRESHOLD_MULTIPLIER    5
+#define THRESHOLD_MULTIPLIER            5
 
 // By what percentage does a timing needs to be away from average to be considered
 // outlier and hence we can assume that pair of address lie on same bank, different
 // rows
-#define OUTLIER_PERCENTAGE      20
+#define OUTLIER_PERCENTAGE              20
 
 // CORE to run on : -1 for last processor
-#define CORE    -1
-#define IA32_MISC_ENABLE_OFFSET 0x1a4
-#define DISBALE_PREFETCH(msr)   (msr |= 0xf)
+#define CORE                            -1
+#define IA32_MISC_ENABLE_OFFSET         0x1a4
+#define DISBALE_PREFETCH(msr)           (msr |= 0xf)
 
 // On some systems, HW prefetch details are not well know. Use BIOS setting for
 // disabling it
-#define SOFTWARE_CONTROL_HWPREFETCH 1
+#define SOFTWARE_CONTROL_HWPREFETCH     0
 
-
-#define MIN_BANKS       8
-#define MAX_BANKS       64
-#define MIN_BANK_SIZE   PAGE_SIZE
+// Following values need not be exact, just approximation. Limits used for
+// memory allocation
+#define MIN_BANKS                       8
+#define MAX_BANKS                       64
+#define MIN_BANK_SIZE                   (PAGE_SIZE * 2)
 
 // An entry is an address we tested to see on which address it lied
-#define NUM_ENTRIES    (NUM_CONTIGOUS_PAGES * PAGE_SIZE) / (MIN_BANK_SIZE)
-#define MAX_NUM_ENTRIES_IN_BANK (NUM_ENTRIES / MIN_BANKS)
+#define NUM_ENTRIES    ((NUM_CONTIGOUS_PAGES * PAGE_SIZE) / (MIN_BANK_SIZE))
+#define MAX_NUM_ENTRIES_IN_BANK         (NUM_ENTRIES)
 typedef struct entry {
    
     uint64_t virt_addr;
@@ -86,7 +95,6 @@ entry_t entries[NUM_ENTRIES];
 
 // DRAM bank
 typedef struct banks_t {
-    int entries_found;          // Did we find any entry which fit in this bank?
     entry_t *main_entry;        // Master entry that belongs to this bank
 } bank_t;
 
@@ -102,15 +110,15 @@ int phy_to_bank_mapping(uint64_t phy_addr)
     bool bit1 = (((phy_addr >> 15) ^ (phy_addr >> 18)) & 1);
     bool bit2 = (((phy_addr >> 16) ^ (phy_addr >> 19)) & 1);
     bool bit3 = (((phy_addr >> 17) ^ (phy_addr >> 20)) & 1);
-    
-    return (bit0 | (bit1 << 1) | (bit2 << 2) | (bit3 << 3));
+    bool bit4 = (((phy_addr >> 13) ^ (phy_addr >> 14) ^
+		  (phy_addr >> 15) ^ (phy_addr >> 16)) & 1);    
+    return (bit0 | (bit1 << 1) | (bit2 << 2) | (bit3 << 3) | (bit4 << 4));
 }
 
 static void init_banks(void)
 {
     int i;
     for (i = 0; i < MAX_BANKS; i++) {
-        banks[i].entries_found = 0;
         banks[i].main_entry = NULL;
     }
 }
@@ -122,9 +130,9 @@ static void init_entries(uint64_t virt_start, uintptr_t phy_start)
     for (i = 0; i < NUM_ENTRIES; i++) {
         entry_t *entry = &entries[i];
         memset(entry, 0, sizeof(*entry));
-        entry->bank = -1;
-        entry->phy_addr = phy_start + i * inter_bank_spacing;
         entry->virt_addr = virt_start + i * inter_bank_spacing;
+        entry->phy_addr = phy_start + i * inter_bank_spacing;
+        entry->bank = -1;
         entry->num_sibling = 0;
         entry->associated = false;
     }
@@ -144,17 +152,16 @@ static int disable_prefetch(int *core, uint64_t *flag)
     if (cpu == -1) {
         cpu = num_cpu - 1;
     } else if (cpu >= num_cpu) {
-        fprintf(stderr, "Invalid CORE\n");
+        eprint("Invalid CORE\n");
         return -1;
     }
     
     CPU_ZERO(&mask);
-    CPU_SET(0, &mask);
     CPU_SET(cpu, &mask);
 
     ret = sched_setaffinity(0, sizeof(mask), &mask);
     if (ret < 0) {
-        fprintf(stderr, "Couldn't set the process affinity\n");
+        eprint("Couldn't set the process affinity\n");
         return -1;
     }
     
@@ -169,13 +176,13 @@ static int disable_prefetch(int *core, uint64_t *flag)
     sprintf(fname, "/dev/cpu/%d/msr", cpu);
     ret = fd = open(fname, O_RDWR);
     if (ret < 0) {
-        fprintf(stderr, "Couldn't open msr dev. Please run 'modprobe msr' and run this program with root permissions\n");
+        eprint("Couldn't open msr dev. Please run 'modprobe msr' and run this program with root permissions\n");
         return -1;
     }
  
     ret = pread(fd, &msr, sizeof(msr), IA32_MISC_ENABLE_OFFSET);
     if (ret != sizeof(msr)) {
-        fprintf(stderr, "Couldn't read msr dev\n");
+        eprint("Couldn't read msr dev\n");
         return -1;
     }
 
@@ -186,7 +193,7 @@ static int disable_prefetch(int *core, uint64_t *flag)
 
     ret = pwrite(fd, &msr, sizeof(msr), IA32_MISC_ENABLE_OFFSET);
     if (ret != sizeof(msr)) {
-        fprintf(stderr, "Couldn't write msr dev: %s\n", strerror(errno));
+        eprint("Couldn't write msr dev: %s\n", strerror(errno));
         return -1;
     }
 
@@ -204,13 +211,13 @@ static int enable_prefetch(int core, uint64_t flag)
     sprintf(fname, "/dev/cpu/%d/msr", core);
     ret = fd = open(fname, O_RDWR);
     if (ret < 0) {
-        fprintf(stderr, "Couldn't open msr dev. Please run 'modprobe msr'\n");
+        eprint("Couldn't open msr dev. Please run 'modprobe msr'\n");
         return -1;
     }
  
     ret = pread(fd, &msr, sizeof(msr), IA32_MISC_ENABLE_OFFSET);
     if (ret != sizeof(msr)) {
-        fprintf(stderr, "Couldn't read msr dev\n");
+        eprint("Couldn't read msr dev\n");
         return -1;
     }
 
@@ -218,7 +225,7 @@ static int enable_prefetch(int core, uint64_t flag)
 
     ret = pwrite(fd, &flag, sizeof(flag), IA32_MISC_ENABLE_OFFSET);
     if (ret != sizeof(msr)) {
-        fprintf(stderr, "Couldn't write msr dev\n");
+        eprint("Couldn't write msr dev\n");
         return -1;
     }
 
@@ -345,8 +352,8 @@ void *is_contiguous(void *_start, size_t length, int contigous_pages)
        
         dprintf("Found contiguous pages\n");
         for (int i = 0; i < found; i++) {
-            uintptr_t v = start + i * PAGE_SIZE;
-            dprintf("Virt:0x%lx, Phy:0x%lx\n", v,  get_physical_addr(v));
+            dprintf("Virt:0x%lx, Phy:0x%lx\n", start + i * PAGE_SIZE,
+                    get_physical_addr(start + i * PAGE_SIZE));
         }
         return (void *)start;
     }
@@ -361,7 +368,7 @@ void *mmap_contiguous(size_t len, uint64_t *phy_start_addr)
     int iret;
     int fd = open(KERNEL_ALLOCATOR_MODULE_FILE, O_RDWR);
     if (fd < 0) {
-        fprintf(stderr, "Couldn't open device file\n");
+        eprint("Couldn't open device file\n");
         return NULL;
     }
 
@@ -370,14 +377,14 @@ void *mmap_contiguous(size_t len, uint64_t *phy_start_addr)
 
     /* We don't close the file. We let it close when exit */
     if (ret == MAP_FAILED) {
-        fprintf(stderr, "Couldn't allocate memory from device\n");
+        eprint("Couldn't allocate memory from device\n");
         return MAP_FAILED;
     }
 
     // Get the physcal address of start address
     iret = ioctl(fd, 0, phy_start_addr);
     if (iret < 0) {
-        fprintf(stderr, "Couldn't find the physical address of start\n");
+        eprint("Couldn't find the physical address of start\n");
         return MAP_FAILED;
     }
 
@@ -405,16 +412,25 @@ void *allocate_contigous(int contiguous_pages, uintptr_t *phy_start) {
     int i;
     size_t len = MEM_SIZE;
 
+    if (contiguous_pages * PAGE_SIZE > len) {
+        eprint("Number of contiguous pages requested is too large\n");
+        return NULL;
+    }
+
     for (i = 0; i < max_itr; i++) {
 #if (KERNEL_ALLOCATOR_MODULE == 1)
         void *virt_start = mmap_contiguous(len, phy_start);
+#elif   (KERNEL_HUGEPAGE_ENABLED == 1)
+        void *virt_start = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,
+                            -1, 0);
 #else
         void *virt_start = mmap(NULL, len, PROT_READ | PROT_WRITE,
                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT,
                            -1, 0);
 #endif
         if(virt_start == MAP_FAILED || virt_start == NULL) {
-            fprintf(stderr, "Memory allocation failed\n");
+            eprint("Memory allocation failed\n");
             return NULL;
         }
         assert(mlock(virt_start, len) == 0);
@@ -440,7 +456,7 @@ void run_exp(uint64_t virt_start, uint64_t phy_start)
 {
     uintptr_t a, b;
     double threshold = LONG_MAX;
-    double avg, sum, running_avg, running_threshold;
+    double avg, sum, running_avg, running_threshold, nearest_nonoutlier;
     double *avgs;
     int i, j, num_outlier;
 
@@ -452,6 +468,9 @@ void run_exp(uint64_t virt_start, uint64_t phy_start)
 
     dprintf("Threshold is %f\n", threshold);
 
+    avgs = calloc(sizeof(double), NUM_ENTRIES);
+    assert(avgs != NULL);
+
     for (i = 0; i < NUM_ENTRIES; i++) {
 
         entry_t *entry = &entries[i];         
@@ -461,13 +480,12 @@ void run_exp(uint64_t virt_start, uint64_t phy_start)
             continue;
 
         dprintf("Master Entry: %d\n", i);
-
-        avgs = calloc(sizeof(double), NUM_ENTRIES);
-        assert(avgs != NULL);
         
         for (j = i + 1, sum = 0; j < NUM_ENTRIES; j++) {
             a = entries[i].virt_addr;
             b = entries[j].virt_addr;
+            dprintf("Reading Time: PhyAddr1: 0x%lx,\t PhyAddr2:0x%lx\n",
+                    entries[i].phy_addr, entries[j].phy_addr);
             avgs[j] = find_read_time((void *)a, (void *)b, threshold);
             sum += avgs[j];
         }
@@ -475,11 +493,12 @@ void run_exp(uint64_t virt_start, uint64_t phy_start)
         running_avg = sum / sub_entries;
         running_threshold = (running_avg * (100.0 + OUTLIER_PERCENTAGE)) / 100.0;
 
-        for (j = i + 1, num_outlier = 0; j < NUM_ENTRIES; j++) {
+        for (j = i + 1, num_outlier = 0, nearest_nonoutlier = 0;
+                j < NUM_ENTRIES; j++) {
             if (avgs[j] >= running_threshold) {
                 if (entries[j].associated) {
-                    fprintf(stderr, "Entry being mapped to multiple siblings\n");
-                    fprintf(stderr, "Entry: PhyAddr: 0x%lx,"
+                    eprint("Entry being mapped to multiple siblings\n");
+                    eprint("Entry: PhyAddr: 0x%lx,"
                             " Prior Sibling: PhyAddr: 0x%lx,"
                             " Current Sibling: PhyAddr: 0x%lx\n",
                             entries[j].phy_addr, entries[j].siblings[0]->phy_addr,
@@ -489,22 +508,47 @@ void run_exp(uint64_t virt_start, uint64_t phy_start)
                     num_outlier++;
                     entries[j].associated = true;
                     entries[j].siblings[0] = entry;
-                    entry->num_sibling = 1;
+                    entries[j].num_sibling = 1;
                 }   
+            } else {
+                nearest_nonoutlier = avgs[j] > nearest_nonoutlier ?
+                                    avgs[j] : nearest_nonoutlier;
             }
         }
         entry->num_sibling = num_outlier;
         entry->associated = false;
+        
+        dprintf("Nearest Nonoutlier: %f, Avg: %f, Threshold: %f\n",
+                nearest_nonoutlier, running_avg, running_threshold);
+        dprintf("Found %d siblings\n", num_outlier);
     }
+
+    free(avgs);
 }
 
+void print_binary(uint64_t v)
+{
+    char buffer[100];
+    int index;
+
+    buffer[99] = '\0';
+    for (index = 98; v > 0; index--) {
+        if (v & 1)
+            buffer[index] = '1';
+        else
+            buffer[index] = '0';
+
+        v = v >> 1;
+    }
+
+    printf("%s", &buffer[index + 1]);
+}
 // Checks mapping/hypothesis
 // TODO: Check if all the bits of address have been accounted for
 void check_mapping(void)
 {
     int i, j;
     int main_bank, bank;
-    int num_true_siblings;
 
     for (i = 0; i < NUM_ENTRIES; i++) {
         entry_t *entry = &entries[i];
@@ -515,30 +559,28 @@ void check_mapping(void)
 
         main_bank = phy_to_bank_mapping(entry->phy_addr);
         entry->bank = main_bank;
-        for (j = 0, num_true_siblings = 0; j < entry->num_sibling; j++) {
+        for (j = 0; j < entry->num_sibling; j++) {
             entry_t *sibling = entry->siblings[j];
             bank = phy_to_bank_mapping(sibling->phy_addr);
             sibling->bank = bank;
             if (bank != main_bank) {
-                fprintf(stderr, "Banks not match for siblings\n");
-                fprintf(stderr, "Main: PhyAddr: 0x%lx Bank:%d, "
+                eprint("Banks not match for siblings\n");
+                eprint("Main: PhyAddr: 0x%lx Bank:%d, "
                                 "Sibling: PhyAddr: 0x%lx Bank: %d\n",
                                 entry->phy_addr, main_bank,
                                 sibling->phy_addr, bank);
-            } else {
-                num_true_siblings++;
             }
         }
 
-        if (banks[main_bank].entries_found != 0) {
-            fprintf(stderr, "Multiple entries belong to same bank\n");
-            fprintf(stderr, "Hypothesis might be insufficient\n");
-            fprintf(stderr, "Bank: %d, Earlier Main Entry: PhyAddr: 0x%lx, "
+        if (banks[main_bank].main_entry != NULL) {
+            eprint("Multiple entries belong to same bank\n");
+            eprint("Hypothesis might be insufficient\n");
+            eprint("Bank: %d, Earlier Main Entry: PhyAddr: 0x%lx, "
                             "Current Main Entry: PhyAddr: 0x:%lx\n",
                             main_bank, banks[main_bank].main_entry->phy_addr,
                             entry->phy_addr);
         } else {
-            banks[main_bank].entries_found = num_true_siblings + 1;
+            banks[main_bank].main_entry = entry;
         }
     }
 
@@ -546,17 +588,33 @@ void check_mapping(void)
     for (i = 0; i < NUM_ENTRIES; i++) {
         entry_t *entry = &entries[i];
         if (entry->bank < 0) {
-            fprintf(stderr, "Entry not assigned any bank: PhyAddr: 0x%lx\n",
+            eprint("Entry not assigned any bank: PhyAddr: 0x%lx\n",
                     entry->phy_addr);
+        }
+
+        if (entry->associated)
+            continue;
+
+        printf("Sets of sibling entries:\n");
+        printf("Bank: %d, PhyAddr: 0x%lx\t\t", entry->bank, entry->phy_addr);
+        print_binary(entry->phy_addr);
+        printf("\n");
+        
+        for (j = 0; j < entry->num_sibling; j++) {
+            printf("Bank: %d, PhyAddr: 0x%lx\t\t", entry->bank, 
+                    entry->siblings[j]->phy_addr);
+            print_binary(entry->siblings[j]->phy_addr);
+            printf("\n");
         }
     }
 
     // Print bank stats
     printf("Banks in use: Total Entries: %d\n", NUM_ENTRIES);
     for (i = 0; i < MAX_BANKS; i++) {
-        if (banks[i].entries_found == 0)
+        if (banks[i].main_entry == NULL)
             continue;
-        printf("Bank:%d, Entries:%d\n", i, banks[i].entries_found);
+        
+        printf("Bank:%d, Entries:%d\n", i, banks[i].main_entry->num_sibling + 1);
     }
 }
 
@@ -578,14 +636,14 @@ int main()
 #if (SOFTWARE_CONTROL_HWPREFETCH == 1)
     ret = disable_prefetch(&core, &pflag);
     if (ret < 0) {
-        fprintf(stderr, "Couldn't disable prefetch\n");
+        eprint("Couldn't disable prefetch\n");
         return -1;
     }
 #endif
 
     virt_start = allocate_contigous(NUM_CONTIGOUS_PAGES, &phy_start);
     if (virt_start == NULL) {
-        fprintf(stderr, "Couldn't find the physical contiguous addresses\n");
+        eprint("Couldn't find the physical contiguous addresses\n");
         return -1;
     }
 
@@ -599,7 +657,7 @@ int main()
 #if (SOFTWARE_CONTROL_HWPREFETCH == 1)
     ret = enable_prefetch(core, pflag);
     if (ret < 0) {
-        fprintf(stderr, "ERROR:Couldn't reset prefetching\n");
+        eprint("Couldn't reset prefetching\n");
         return -1;
     }
 #endif
