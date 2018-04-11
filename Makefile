@@ -5,7 +5,7 @@ OBJECT=bank_test
 
 all: $(OBJECT) $(KOBJECT)
 
-*_test: *_test.c
+bank_test: bank_test.c
 	$(LCC) $(LCFLAGS) -o $@ $?
 
 
