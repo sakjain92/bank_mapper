@@ -37,7 +37,7 @@
 #define KERNEL_HUGEPAGE_ENABLED         1
 #define KERNEL_HUGEPAGE_SIZE            (1024 * 1024 * 1024)    // 1 GB
 
-#define MEM_SIZE                        (1 << 21)
+#define MEM_SIZE                        (1 << 20)
 
 // Using mmap(), we might/might not get contigous pages. We need to try multiple
 // times.
@@ -76,7 +76,7 @@
 // memory allocation
 #define MIN_BANKS                       8
 #define MAX_BANKS                       64
-#define MIN_BANK_SIZE                   (PAGE_SIZE * 2)
+#define MIN_BANK_SIZE                   (PAGE_SIZE/ 2)
 
 // An entry is an address we tested to see on which address it lied
 #define NUM_ENTRIES    ((NUM_CONTIGOUS_PAGES * PAGE_SIZE) / (MIN_BANK_SIZE))
@@ -110,7 +110,7 @@ int phy_to_bank_mapping(uint64_t phy_addr)
     bool bit1 = (((phy_addr >> 15) ^ (phy_addr >> 18)) & 1);
     bool bit2 = (((phy_addr >> 16) ^ (phy_addr >> 19)) & 1);
     bool bit3 = (((phy_addr >> 17) ^ (phy_addr >> 20)) & 1);
-    bool bit4 = (((phy_addr >> 13) ^ (phy_addr >> 14) ^
+    bool bit4 = (((phy_addr >> 12) ^ (phy_addr >> 13) ^ (phy_addr >> 14) ^
 		  (phy_addr >> 15) ^ (phy_addr >> 16)) & 1);    
     return (bit0 | (bit1 << 1) | (bit2 << 2) | (bit3 << 3) | (bit4 << 4));
 }
@@ -473,7 +473,7 @@ void run_exp(uint64_t virt_start, uint64_t phy_start)
 
     for (i = 0; i < NUM_ENTRIES; i++) {
 
-        entry_t *entry = &entries[i];         
+        entry_t *entry = &entries[i]; 
         int sub_entries = NUM_ENTRIES - (i + 1);
         
         if (entry->associated)
@@ -492,17 +492,34 @@ void run_exp(uint64_t virt_start, uint64_t phy_start)
 
         running_avg = sum / sub_entries;
         running_threshold = (running_avg * (100.0 + OUTLIER_PERCENTAGE)) / 100.0;
-
+        entry->associated = false;
         for (j = i + 1, num_outlier = 0, nearest_nonoutlier = 0;
                 j < NUM_ENTRIES; j++) {
             if (avgs[j] >= running_threshold) {
                 if (entries[j].associated) {
-                    eprint("Entry being mapped to multiple siblings\n");
-                    eprint("Entry: PhyAddr: 0x%lx,"
-                            " Prior Sibling: PhyAddr: 0x%lx,"
-                            " Current Sibling: PhyAddr: 0x%lx\n",
-                            entries[j].phy_addr, entries[j].siblings[0]->phy_addr,
-                            entry->phy_addr);
+                    /* Could be in the same bank and same row */
+                    if (phy_to_bank_mapping(entry->phy_addr) ==
+                             phy_to_bank_mapping(entries[j].siblings[0]->phy_addr)) {
+                        entry_t *prior_entry = entries[j].siblings[0];
+                        int siblings = prior_entry->num_sibling;
+                        prior_entry->siblings[siblings] = entry;
+                        prior_entry->num_sibling++;
+                        entry->associated = true;
+                        entry->num_sibling = 1;
+                        entry->siblings[0] = prior_entry;
+                        
+                        printf("Assuming lie on same bank:0x%lx, 0x%lx\n",
+                                prior_entry->phy_addr, entry->phy_addr);
+                        break;
+                        
+                    } else {
+                        eprint("Entry being mapped to multiple siblings\n");
+                        eprint("Entry: PhyAddr: 0x%lx,"
+                                " Prior Sibling: PhyAddr: 0x%lx,"
+                                " Current Sibling: PhyAddr: 0x%lx\n",
+                                entries[j].phy_addr, entries[j].siblings[0]->phy_addr,
+                                entry->phy_addr);
+                    } 
                 } else {
                     entry->siblings[num_outlier] = &entries[j];
                     num_outlier++;
@@ -515,8 +532,10 @@ void run_exp(uint64_t virt_start, uint64_t phy_start)
                                     avgs[j] : nearest_nonoutlier;
             }
         }
-        entry->num_sibling = num_outlier;
-        entry->associated = false;
+
+        if (entry->associated == false) {
+            entry->num_sibling = num_outlier;
+        }
         
         dprintf("Nearest Nonoutlier: %f, Avg: %f, Threshold: %f\n",
                 nearest_nonoutlier, running_avg, running_threshold);
