@@ -37,7 +37,7 @@
 #define KERNEL_HUGEPAGE_ENABLED         1
 #define KERNEL_HUGEPAGE_SIZE            (1024 * 1024 * 1024)    // 1 GB
 
-#define MEM_SIZE                        (1 << 20)
+#define MEM_SIZE                        (1 << 25)
 
 // Using mmap(), we might/might not get contigous pages. We need to try multiple
 // times.
@@ -452,13 +452,31 @@ void *allocate_contigous(int contiguous_pages, uintptr_t *phy_start) {
     return NULL;
 }
 
+void print_binary(uint64_t v)
+{
+    char buffer[100];
+    int index;
+
+    buffer[99] = '\0';
+    for (index = 98; v > 0; index--) {
+        if (v & 1)
+            buffer[index] = '1';
+        else
+            buffer[index] = '0';
+
+        v = v >> 1;
+    }
+
+    printf("%s", &buffer[index + 1]);
+}
+
 void run_exp(uint64_t virt_start, uint64_t phy_start)
 {
     uintptr_t a, b;
     double threshold = LONG_MAX;
     double avg, sum, running_avg, running_threshold, nearest_nonoutlier;
     double *avgs;
-    int i, j, num_outlier;
+    int i, j, k, num_outlier;
 
     // Warm up - Get refined threshold 
     a = virt_start;
@@ -535,6 +553,13 @@ void run_exp(uint64_t virt_start, uint64_t phy_start)
 
         if (entry->associated == false) {
             entry->num_sibling = num_outlier;
+                
+            for (k = 0; k < entry->num_sibling; k++) {
+                printf("Siblings: PhyAddr: 0x%lx\tPhyAddr: 0x%lx\t\t", entry->phy_addr, 
+                    entry->siblings[k]->phy_addr);
+                print_binary(entry->siblings[k]->phy_addr);
+                printf("\n");
+            }
         }
         
         dprintf("Nearest Nonoutlier: %f, Avg: %f, Threshold: %f\n",
@@ -545,23 +570,7 @@ void run_exp(uint64_t virt_start, uint64_t phy_start)
     free(avgs);
 }
 
-void print_binary(uint64_t v)
-{
-    char buffer[100];
-    int index;
 
-    buffer[99] = '\0';
-    for (index = 98; v > 0; index--) {
-        if (v & 1)
-            buffer[index] = '1';
-        else
-            buffer[index] = '0';
-
-        v = v >> 1;
-    }
-
-    printf("%s", &buffer[index + 1]);
-}
 // Checks mapping/hypothesis
 // TODO: Check if all the bits of address have been accounted for
 void check_mapping(void)
