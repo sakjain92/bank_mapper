@@ -16,108 +16,62 @@
 #include <stdbool.h>
 #include <sys/ioctl.h>
 
-#define DEBUG                           1
-#if (DEBUG == 1)
-#define dprintf(...)                    printf(__VA_ARGS__)
-#else
-#define dprintf(...)
+#include "common.h"
+
+#if (EVAL_GPU == 1)
+double find_gpu_read_time(void *_a, void *_b, double threshold);
+void *allocate_gpu_contigous(int contiguous_pages, uintptr_t *phy_start);
 #endif
 
-#define eprint(...)	                    fprintf(stderr, "ERROR:" __VA_ARGS__)
-
-#define PAGE_SHIFT                      12
-#define PAGE_SIZE                       (1 << PAGE_SHIFT)
-#define PAGE_MASK                       (PAGE_SIZE - 1)
-
-// Enable at most one of these option
-// Priority order is: Kernel Allocator module > Huge Page > Simple Iterative mmap()
-// Are we using kernel allocator module to allocate contiguous memory?
-#define KERNEL_ALLOCATOR_MODULE         0
-#define KERNEL_ALLOCATOR_MODULE_FILE    "/dev/kam"
-#define KERNEL_HUGEPAGE_ENABLED         1
-#define KERNEL_HUGEPAGE_SIZE            (1024 * 1024 * 1024)    // 1 GB
-
-#define MEM_SIZE                        (1 << 25)
-
-// Using mmap(), we might/might not get contigous pages. We need to try multiple
-// times.
-// Using kernel module, if we can get, we wll get all contiguous on first attempt
-#if (KERNEL_ALLOCATOR_MODULE == 1)
-#define NUM_CONTIGOUS_PAGES             (MEM_SIZE / PAGE_SIZE)
-#define MAX_MMAP_ITR                    1
-#elif (KERNEL_HUGEPAGE_ENABLED == 1)
-#define NUM_CONTIGOUS_PAGES             (MEM_SIZE > KERNEL_HUGEPAGE_SIZE ?      \
-                                        (KERNEL_HUGEPAGE_SIZE / PAGE_SIZE) :    \
-                                        (MEM_SIZE / PAGE_SIZE))
-#define MAX_MMAP_ITR                    1
-#endif
-
-#define MAX_INNER_LOOP                  10
-#define MAX_OUTER_LOOP                  100000
-
-// Threshold for timing
-#define THRESHOLD_MULTIPLIER            5
-
-// By what percentage does a timing needs to be away from average to be considered
-// outlier and hence we can assume that pair of address lie on same bank, different
-// rows
-#define OUTLIER_PERCENTAGE              20
-
-// CORE to run on : -1 for last processor
-#define CORE                            -1
-#define IA32_MISC_ENABLE_OFFSET         0x1a4
-#define DISBALE_PREFETCH(msr)           (msr |= 0xf)
-
-// On some systems, HW prefetch details are not well know. Use BIOS setting for
-// disabling it
-#define SOFTWARE_CONTROL_HWPREFETCH     0
-
-// Following values need not be exact, just approximation. Limits used for
-// memory allocation
-#define MIN_BANKS                       8
-#define MAX_BANKS                       64
-#define MIN_BANK_SIZE                   (PAGE_SIZE/ 2)
-
-// An entry is an address we tested to see on which address it lied
-#define NUM_ENTRIES    ((NUM_CONTIGOUS_PAGES * PAGE_SIZE) / (MIN_BANK_SIZE))
-#define MAX_NUM_ENTRIES_IN_BANK         (NUM_ENTRIES)
-typedef struct entry {
-   
-    uint64_t virt_addr;
-    uint64_t phy_addr;                              // Physical address of entry
-    int bank;                                       // Bank on which this lies
-    struct entry *siblings[MAX_NUM_ENTRIES_IN_BANK];// Entries that lie on same banks
-    int num_sibling;
-    int associated;                                 // Is this someone's sibling?
-} entry_t;
-
-entry_t entries[NUM_ENTRIES];
-
-// DRAM bank
-typedef struct banks_t {
-    entry_t *main_entry;        // Master entry that belongs to this bank
-} bank_t;
-
-bank_t banks[MAX_BANKS];
+entry_t *entries;
+bank_t *banks;
 
 // This is the crux of program. This function is a hypothesis of the 
 // physical address to dram bank mapping function.
 // It takes a physical address and returns the bank it thinks it belongs to.
 // The program will try to test if this function/hypothesis is correct/complete
-int phy_to_bank_mapping(uint64_t phy_addr)
+int phy_to_bank_mapping_cpu(uint64_t phy_addr)
 {
     bool bit0 = ((phy_addr >> 14) & 1);
     bool bit1 = (((phy_addr >> 15) ^ (phy_addr >> 18)) & 1);
     bool bit2 = (((phy_addr >> 16) ^ (phy_addr >> 19)) & 1);
     bool bit3 = (((phy_addr >> 17) ^ (phy_addr >> 20)) & 1);
-    bool bit4 = (((phy_addr >> 12) ^ (phy_addr >> 13) ^ (phy_addr >> 14) ^
+    bool bit4 = (((phy_addr >> 13) ^ (phy_addr >> 14) ^
 		  (phy_addr >> 15) ^ (phy_addr >> 16)) & 1);    
     return (bit0 | (bit1 << 1) | (bit2 << 2) | (bit3 << 3) | (bit4 << 4));
+}
+
+// The program will try to test if this function/hypothesis is correct/complete
+int phy_to_bank_mapping_gpu(uint64_t phy_addr)
+{
+    bool bit0 = ((phy_addr >> 15) & 1);
+    bool bit1 = (((phy_addr >> 12) ^ (phy_addr >> 19) ^ (phy_addr >> 20)) & 1);  
+    bool bit2 = (((phy_addr >> 13) ^ (phy_addr >> 20) ^ (phy_addr >> 24)) & 1); 
+    bool bit3 = (((phy_addr >> 16) ^ (phy_addr >> 19) ^ (phy_addr >> 23)) & 1); 
+    bool bit4 = (((phy_addr >> 18) ^ (phy_addr >> 22) ^ (phy_addr >> 24)) & 1);
+    bool bit5 = (((phy_addr >> 19) ^ (phy_addr >> 21) ^ (phy_addr >> 22)) & 1);
+    bool bit6 = (((phy_addr >> 12) ^ (phy_addr >> 16) ^
+		  (phy_addr >> 17) ^ (phy_addr >> 18)) & 1);    
+    return (bit0 | (bit1 << 1) | (bit2 << 2) | (bit3 << 3) | (bit4 << 4) |
+            (bit5 << 5) | (bit6 << 6));
+}
+
+int phy_to_bank_mapping(uint64_t phy_addr)
+{
+#if (EVAL_CPU == 1)
+    return phy_to_bank_mapping_cpu(phy_addr);
+#else
+    return phy_to_bank_mapping_gpu(phy_addr);
+#endif
 }
 
 static void init_banks(void)
 {
     int i;
+
+    banks = malloc(sizeof(bank_t) * MAX_BANKS);
+    assert(banks != NULL);
+
     for (i = 0; i < MAX_BANKS; i++) {
         banks[i].main_entry = NULL;
     }
@@ -127,6 +81,10 @@ static void init_entries(uint64_t virt_start, uintptr_t phy_start)
 {
     uintptr_t inter_bank_spacing = MIN_BANK_SIZE;
     int i;
+
+    entries = malloc(sizeof(entry_t) * NUM_ENTRIES);
+    assert(entries != NULL);
+
     for (i = 0; i < NUM_ENTRIES; i++) {
         entry_t *entry = &entries[i];
         memset(entry, 0, sizeof(*entry));
@@ -139,11 +97,11 @@ static void init_entries(uint64_t virt_start, uintptr_t phy_start)
 }
 
 #if (SOFTWARE_CONTROL_HWPREFETCH == 1)
-static int disable_prefetch(int *core, uint64_t *flag)
+int disable_cpu_prefetch(int *core, uint64_t *flag)
 {
     // Assocaite with a single processor
     int num_cpu = get_nprocs();
-    int cpu = CORE;
+    int cpu = CPU_CORE;
     cpu_set_t  mask;
     int ret, fd;
     char fname[100];
@@ -202,7 +160,7 @@ static int disable_prefetch(int *core, uint64_t *flag)
     return 0;
 }
 
-static int enable_prefetch(int core, uint64_t flag)
+int enable_cpu_prefetch(int core, uint64_t flag)
 {
     int ret, fd;
     char fname[100];
@@ -235,7 +193,7 @@ static int enable_prefetch(int core, uint64_t flag)
 }
 #endif /* SOFTWARE_CONTROL_HWPREFETCH == 1 */
 
-static inline uint64_t currentTicks(void)
+static inline uint64_t current_cpu_ticks(void)
 {
       unsigned int a, d;
       asm volatile("rdtsc" : "=a" (a), "=d" (d));
@@ -243,7 +201,7 @@ static inline uint64_t currentTicks(void)
 }
 
 // Returns the avg time
-double find_read_time(void *_a, void *_b, double threshold)
+double find_cpu_read_time(void *_a, void *_b, double threshold)
 {
     uint64_t a = (uint64_t)(uintptr_t)_a;
     uint64_t b = (uint64_t)(uintptr_t)_b;
@@ -261,7 +219,7 @@ double find_read_time(void *_a, void *_b, double threshold)
     for (i = 0, sum_ticks = 0, min_ticks = LONG_MAX, max_ticks = 0;
             i < MAX_OUTER_LOOP; i++) {
         
-        start_ticks = currentTicks();
+        start_ticks = current_cpu_ticks();
         for (j = 0, sum = 0; j < MAX_INNER_LOOP; j++) {
             asm volatile ("addl (%1), %0\n\t"
                           "addl (%2), %0\n\t"
@@ -269,7 +227,7 @@ double find_read_time(void *_a, void *_b, double threshold)
                           "clflush (%2)\n\t"
                           "mfence\n\t": "=r" (sum) : "r" (a), "r" (b) : "memory");
         }
-        end_ticks = currentTicks();
+        end_ticks = current_cpu_ticks();
 
         ticks = end_ticks - start_ticks;
         assert(ticks > 0);
@@ -296,7 +254,15 @@ double find_read_time(void *_a, void *_b, double threshold)
     return avg_ticks;
 }
 
-uintptr_t get_physical_addr(uintptr_t virtual_addr) {
+double find_read_time(void *a, void *b, double threshold) {
+#if (EVAL_CPU == 1)
+    return find_cpu_read_time(a, b, threshold);
+#else
+    return find_gpu_read_time(a, b, threshold);
+#endif
+}
+
+uintptr_t get_cpu_physical_addr(uintptr_t virtual_addr) {
     
     uint64_t frame_num;
     int ret;
@@ -321,7 +287,7 @@ uintptr_t get_physical_addr(uintptr_t virtual_addr) {
 /* Searches if from start to start + length - 1 has at any point contigous pages
  * which are contigous. If so, returns the start address of them
  */
-void *is_contiguous(void *_start, size_t length, int contigous_pages)
+void *is_cpu_contiguous(void *_start, size_t length, int contigous_pages)
 {
     uintptr_t start = (uintptr_t)_start;
     uintptr_t end = start + length - 1;
@@ -333,11 +299,11 @@ void *is_contiguous(void *_start, size_t length, int contigous_pages)
     assert((length & PAGE_MASK) == 0);
     assert((start + length) > start);
 
-    for(current = start + PAGE_SIZE, prev_phy_addr = get_physical_addr(start);
+    for(current = start + PAGE_SIZE, prev_phy_addr = get_cpu_physical_addr(start);
             current <= end && found < contigous_pages;
             current += PAGE_SIZE) {
         
-        uintptr_t cur_phy_addr = get_physical_addr(current);
+        uintptr_t cur_phy_addr = get_cpu_physical_addr(current);
         if (cur_phy_addr == (prev_phy_addr + PAGE_SIZE)) {
                 found++;
         } else {
@@ -353,7 +319,7 @@ void *is_contiguous(void *_start, size_t length, int contigous_pages)
         dprintf("Found contiguous pages\n");
         for (int i = 0; i < found; i++) {
             dprintf("Virt:0x%lx, Phy:0x%lx\n", start + i * PAGE_SIZE,
-                    get_physical_addr(start + i * PAGE_SIZE));
+                    get_cpu_physical_addr(start + i * PAGE_SIZE));
         }
         return (void *)start;
     }
@@ -362,7 +328,7 @@ void *is_contiguous(void *_start, size_t length, int contigous_pages)
 }
 
 #if (KERNEL_ALLOCATOR_MODULE==1)
-void *mmap_contiguous(size_t len, uint64_t *phy_start_addr)
+void *mmap_kam_cpu_contiguous(size_t len, uint64_t *phy_start_addr)
 {
     void *ret;
     int iret;
@@ -406,7 +372,7 @@ void *mmap_contiguous(size_t len, uint64_t *phy_start_addr)
 #endif // KERNEL_ALLOCATOR_MODULE==1
 
 /* Tries to allocate physical contigous pages and return the start address */
-void *allocate_contigous(int contiguous_pages, uintptr_t *phy_start) {
+void *allocate_cpu_contigous(int contiguous_pages, uintptr_t *phy_start) {
     
     int max_itr = MAX_MMAP_ITR;
     int i;
@@ -419,7 +385,7 @@ void *allocate_contigous(int contiguous_pages, uintptr_t *phy_start) {
 
     for (i = 0; i < max_itr; i++) {
 #if (KERNEL_ALLOCATOR_MODULE == 1)
-        void *virt_start = mmap_contiguous(len, phy_start);
+        void *virt_start = mmap_kam_cpu_contiguous(len, phy_start);
 #elif   (KERNEL_HUGEPAGE_ENABLED == 1)
         void *virt_start = mmap(NULL, len, PROT_READ | PROT_WRITE,
                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,
@@ -439,9 +405,9 @@ void *allocate_contigous(int contiguous_pages, uintptr_t *phy_start) {
         // Allocation by kernel is always contigous
         return virt_start;
 #endif
-        void *ret = is_contiguous(virt_start, len, contiguous_pages);
+        void *ret = is_cpu_contiguous(virt_start, len, contiguous_pages);
         if (ret != NULL) {
-            *phy_start = get_physical_addr((uintptr_t)virt_start);
+            *phy_start = get_cpu_physical_addr((uintptr_t)virt_start);
             return ret;
         }
 
@@ -450,6 +416,14 @@ void *allocate_contigous(int contiguous_pages, uintptr_t *phy_start) {
     }
 
     return NULL;
+}
+
+void *allocate_contigous(int contiguous_pages, uintptr_t *phy_start) {
+#if (EVAL_CPU == 1)
+    return allocate_cpu_contigous(contiguous_pages, phy_start);
+#else
+    return allocate_gpu_contigous(contiguous_pages, phy_start);
+#endif
 }
 
 void print_binary(uint64_t v)
@@ -476,6 +450,7 @@ void run_exp(uint64_t virt_start, uint64_t phy_start)
     double threshold = LONG_MAX;
     double avg, sum, running_avg, running_threshold, nearest_nonoutlier;
     double *avgs;
+    double min_avg, max_avg;
     int i, j, k, num_outlier;
 
     // Warm up - Get refined threshold 
@@ -490,8 +465,8 @@ void run_exp(uint64_t virt_start, uint64_t phy_start)
     assert(avgs != NULL);
 
     for (i = 0; i < NUM_ENTRIES; i++) {
-
-        entry_t *entry = &entries[i]; 
+        
+	entry_t *entry = &entries[i];         
         int sub_entries = NUM_ENTRIES - (i + 1);
         
         if (entry->associated)
@@ -499,45 +474,49 @@ void run_exp(uint64_t virt_start, uint64_t phy_start)
 
         dprintf("Master Entry: %d\n", i);
         
-        for (j = i + 1, sum = 0; j < NUM_ENTRIES; j++) {
+        for (j = i + 1, sum = 0, min_avg = LONG_MAX, max_avg = 0;
+                j < NUM_ENTRIES; j++) {
             a = entries[i].virt_addr;
             b = entries[j].virt_addr;
             dprintf("Reading Time: PhyAddr1: 0x%lx,\t PhyAddr2:0x%lx\n",
                     entries[i].phy_addr, entries[j].phy_addr);
             avgs[j] = find_read_time((void *)a, (void *)b, threshold);
             sum += avgs[j];
+            min_avg = avgs[j] < min_avg ? avgs[j] : min_avg;
+            max_avg = avgs[j] > max_avg ? avgs[j] : max_avg;
         }
 
         running_avg = sum / sub_entries;
         running_threshold = (running_avg * (100.0 + OUTLIER_PERCENTAGE)) / 100.0;
         entry->associated = false;
+
+        printf("Running avg: %f, Min Avg: %f, Max Avg: %f, Percentage diff: %f\n",
+                running_avg, min_avg, max_avg, (max_avg - min_avg) / (min_avg));
+
         for (j = i + 1, num_outlier = 0, nearest_nonoutlier = 0;
                 j < NUM_ENTRIES; j++) {
             if (avgs[j] >= running_threshold) {
                 if (entries[j].associated) {
-                    /* Could be in the same bank and same row */
-                    if (phy_to_bank_mapping(entry->phy_addr) ==
-                             phy_to_bank_mapping(entries[j].siblings[0]->phy_addr)) {
-                        entry_t *prior_entry = entries[j].siblings[0];
-                        int siblings = prior_entry->num_sibling;
-                        prior_entry->siblings[siblings] = entry;
-                        prior_entry->num_sibling++;
-                        entry->associated = true;
-                        entry->num_sibling = 1;
-                        entry->siblings[0] = prior_entry;
-                        
-                        printf("Assuming lie on same bank:0x%lx, 0x%lx\n",
+                    entry_t *prior_entry = entries[j].siblings[0];
+                    int siblings = prior_entry->num_sibling;
+                    
+                    eprint("Entry being mapped to multiple siblings\n");
+                    eprint("Entry: PhyAddr: 0x%lx,"
+                            " Prior Sibling: PhyAddr: 0x%lx,"
+                            " Current Sibling: PhyAddr: 0x%lx\n",
+                            entries[j].phy_addr, prior_entry->phy_addr,
+                            entry->phy_addr);
+
+                    printf("Assuming lie on same bank:0x%lx, 0x%lx\n",
                                 prior_entry->phy_addr, entry->phy_addr);
-                        break;
-                        
-                    } else {
-                        eprint("Entry being mapped to multiple siblings\n");
-                        eprint("Entry: PhyAddr: 0x%lx,"
-                                " Prior Sibling: PhyAddr: 0x%lx,"
-                                " Current Sibling: PhyAddr: 0x%lx\n",
-                                entries[j].phy_addr, entries[j].siblings[0]->phy_addr,
-                                entry->phy_addr);
-                    } 
+
+                    prior_entry->siblings[siblings] = entry;
+                    prior_entry->num_sibling++;
+                    entry->associated = true;
+                    entry->num_sibling = 1;
+                    entry->siblings[0] = prior_entry;
+
+                    break;
                 } else {
                     entry->siblings[num_outlier] = &entries[j];
                     num_outlier++;
@@ -662,7 +641,7 @@ int main()
     printf("Please don't terminate the program by Ctrl-C\n");
     
 #if (SOFTWARE_CONTROL_HWPREFETCH == 1)
-    ret = disable_prefetch(&core, &pflag);
+    ret = disable_cpu_prefetch(&core, &pflag);
     if (ret < 0) {
         eprint("Couldn't disable prefetch\n");
         return -1;
@@ -683,7 +662,7 @@ int main()
     check_mapping();
 
 #if (SOFTWARE_CONTROL_HWPREFETCH == 1)
-    ret = enable_prefetch(core, pflag);
+    ret = enable_cpu_prefetch(core, pflag);
     if (ret < 0) {
         eprint("Couldn't reset prefetching\n");
         return -1;
