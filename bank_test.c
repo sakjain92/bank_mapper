@@ -35,7 +35,7 @@
 #define KERNEL_ALLOCATOR_MODULE         0
 #define KERNEL_ALLOCATOR_MODULE_FILE    "/dev/kam"
 #define KERNEL_HUGEPAGE_ENABLED         1
-#define KERNEL_HUGEPAGE_SIZE            (1024 * 1024 * 1024)    // 1 GB
+#define KERNEL_HUGEPAGE_SIZE            (2 * 1024 * 1024)    // 2 MB
 
 #define MEM_SIZE                        (1 << 25)
 
@@ -61,7 +61,7 @@
 // By what percentage does a timing needs to be away from average to be considered
 // outlier and hence we can assume that pair of address lie on same bank, different
 // rows
-#define OUTLIER_PERCENTAGE              20
+#define OUTLIER_PERCENTAGE              30
 
 // CORE to run on : -1 for last processor
 #define CORE                            -1
@@ -70,7 +70,7 @@
 
 // On some systems, HW prefetch details are not well know. Use BIOS setting for
 // disabling it
-#define SOFTWARE_CONTROL_HWPREFETCH     0
+#define SOFTWARE_CONTROL_HWPREFETCH     1
 
 // Following values need not be exact, just approximation. Limits used for
 // memory allocation
